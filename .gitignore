@@ -1,0 +1,4 @@
+*.wav
+*.npy
+*.json
+__pycache__/

@@ -1,4 +1,7 @@
 *.wav
 *.npy
-*.json
 __pycache__/
+*.npz
+.venv/
+data/
+results/

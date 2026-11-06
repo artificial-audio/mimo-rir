@@ -1,10 +1,11 @@
 """MIMO RIR measurement prototype: excitation generation and deconvolution.
 
 M loudspeakers play one multichannel WAV (from Reaper), K microphones are recorded
-sample-synchronously on the same interface. Three methods:
+sample-synchronously on the same interface. Methods:
 
   ess      exponential sweeps, one loudspeaker at a time (non-simultaneous reference)
   perfect  one periodic perfect sweep, circularly shifted by m*L for loudspeaker m
+  cyclic   same cyclic waveform; short warm-up, one measured period by default
   noise    independent Gaussian white noise per loudspeaker, cross-correlation
 
   python mimo_rir.py gen perfect -o perfect          -> perfect.wav (play) + perfect.json (keep)
@@ -15,6 +16,7 @@ deconv regenerates the excitation from the .json, so the big WAV is never read b
 """
 import argparse
 import json
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -38,11 +40,37 @@ def perfect_sweep(N):
     return x / np.abs(x).max()
 
 
+def periodic_sweep(meta):
+    """Base period; exponential variant has pink power above f1 and a nonzero LF shelf."""
+    N = meta['speakers'] * meta['ir_len']
+    if meta.get('waveform', 'linear') == 'linear':
+        return perfect_sweep(N)
+    if meta['waveform'] != 'exponential':
+        raise ValueError('waveform must be linear or exponential')
+    fs, f1 = meta['fs'], meta['f1']
+    if not np.isfinite(f1) or not 0 < f1 < fs / 2:
+        raise ValueError('f1 must be between zero and Nyquist')
+    f = np.fft.rfftfreq(N, 1 / fs)
+    # Integrating t(f)=T*log(f/f1)/log(Nyquist/f1) gives exponential group delay.
+    integral = f * np.log(np.maximum(f, fs / N) / f1) - f + f1
+    phase = -2 * np.pi * (N / fs) / np.log(fs / 2 / f1) * integral
+    X = np.exp(1j * phase) / np.sqrt(np.maximum(f, f1))
+    # Continue the phase below f1 to avoid concentrating the LF shelf into a large pulse.
+    X[0] = np.copysign(abs(X[0]), X[0].real)
+    # A real Nyquist bin preserves its magnitude; phase is rounded to 0 or pi.
+    if N % 2 == 0:
+        X[-1] = np.copysign(abs(X[-1]), X[-1].real)
+    x = irfft(X, N)
+    return x / np.abs(x).max()
+
+
 def n_samples(meta):
     """Excitation length; the WAV adds ir_len samples of silence after it."""
     M, L = meta['speakers'], meta['ir_len']
     if meta['method'] == 'ess':
         return M * (meta['sweep_len'] + L)
+    if meta['method'] == 'cyclic':
+        return meta['pre_roll'] + meta['periods'] * M * L + meta['fade']
     return meta['periods'] * M * L if meta['method'] == 'perfect' else meta['dur']
 
 
@@ -56,8 +84,14 @@ def excite(meta, a, b):
         on = (i < len(s)) & (slot < M)
         x = np.zeros((b - a, M))
         x[on.nonzero()[0], slot[on]] = s[i[on]]
-    elif meta['method'] == 'perfect':
-        x = perfect_sweep(M * L)[(t[:, None] - L * np.arange(M)) % (M * L)]
+    elif meta['method'] in ('perfect', 'cyclic'):
+        phase = t - meta.get('pre_roll', 0)
+        x = periodic_sweep(meta)[(phase[:, None] - L * np.arange(M)) % (M * L)]
+        if meta['method'] == 'cyclic':
+            fade = meta['fade']
+            ramp_in = np.clip(t / (fade - 1), 0, 1)
+            ramp_out = np.clip((n_samples(meta) - 1 - t) / (fade - 1), 0, 1)
+            x *= ((1 - np.cos(np.pi * ramp_in)) * (1 - np.cos(np.pi * ramp_out)) / 4)[:, None]
     else:  # noise: one RNG stream per 1 s block, so any range can be regenerated
         c0, c1 = a // fs, -(-b // fs)
         x = np.concatenate([np.random.default_rng([meta['seed'], c]).standard_normal((fs, M)) for c in range(c0, c1)])
@@ -77,9 +111,47 @@ def gen(meta, out):
     print(f"{out}.wav: {(n + meta['ir_len']) / fs:.1f} s, {meta['speakers']} ch")
 
 
+def gen_cyclic_sweeps(out, *, speakers=128, ir_len=0.75, fs=48000, gain=0.5, periods=1,
+                      waveform='linear', f1=20.0):
+    """Write shifted cyclic sweeps + JSON. ir_len is RIR support/spacing in seconds.
+
+    All speakers play simultaneously. One measured period lasts speakers*ir_len;
+    a 10 ms fade-in plus one RIR-length warm-up establishes the periodic state.
+    Fades occur only outside the measured periods; internal wraps stay unchanged.
+    """
+    if not all(isinstance(v, (int, np.integer)) and v > 0 for v in (speakers, fs, periods)):
+        raise ValueError('speakers, fs and periods must be positive integers')
+    if not np.isfinite(ir_len) or ir_len <= 0 or not np.isfinite(gain) or not 0 < gain <= 1:
+        raise ValueError('ir_len must be positive and finite; gain must be in (0, 1]')
+    if waveform not in ('linear', 'exponential'):
+        raise ValueError('waveform must be linear or exponential')
+    if waveform == 'exponential' and (not np.isfinite(f1) or not 0 < f1 < fs / 2):
+        raise ValueError('f1 must be between zero and Nyquist')
+    L = 2 * round(ir_len * fs / 2)
+    if L < 2:
+        raise ValueError('ir_len must span at least two samples')
+    out = str(out)
+    if any(Path(out + ext).exists() for ext in ('.wav', '.json')):
+        raise FileExistsError(f'{out}.wav or .json already exists; choose a new output name')
+    fade = max(2, round(0.01 * fs))
+    meta = dict(method='cyclic', fs=fs, speakers=speakers, ir_len=L, gain=gain,
+                periods=periods, pre_roll=L + fade, fade=fade)
+    if waveform == 'exponential':
+        meta.update(waveform=waveform, f1=f1)
+    gen(meta, out)
+    print(f"All {speakers} speakers simultaneous; spacing {L/fs:.6g} s; "
+          f"{periods} measured period(s) of {speakers*L/fs:.6g} s; "
+          f"warm-up {meta['pre_roll']/fs:.6g} s; no period discarded.")
+    return meta
+
+
 def deconv(meta, y):
     """y: recording [n, mics], sample 0 = excitation start. Returns h [mics, M, L]."""
     M, L, fs, g = meta['speakers'], meta['ir_len'], meta['fs'], meta['gain']
+    if meta['method'] == 'cyclic':
+        required = meta['pre_roll'] + meta['periods'] * M * L
+        if len(y) < required:
+            raise ValueError(f'cyclic recording is short: {len(y)} samples; need {required}')
     y = np.pad(y, ((0, max(0, n_samples(meta) + L - len(y))), (0, 0)))
     if meta['method'] == 'ess':
         s = ess(meta['sweep_len'], fs, meta['f1'])
@@ -89,10 +161,14 @@ def deconv(meta, y):
         inv = X.conj() / (np.abs(X) ** 2 + 1e-8 * np.abs(X).max() ** 2)
         h = np.stack([irfft(rfft(y[m * S:(m + 1) * S], nfft, axis=0) * inv[:, None], nfft, axis=0)[:L] for m in range(M)])
         return h.transpose(2, 0, 1) / g
-    if meta['method'] == 'perfect':
+    if meta['method'] in ('perfect', 'cyclic'):
         N, P = M * L, meta['periods']
-        Y = y[N:P * N].reshape(P - 1, N, -1).mean(0)  # drop first period (transient), average the rest
-        d = irfft(rfft(Y, axis=0) / rfft(perfect_sweep(N))[:, None], N, axis=0)
+        if meta['method'] == 'cyclic':
+            start = meta['pre_roll']
+            Y = y[start:start + P * N].reshape(P, N, -1).mean(0)
+        else:
+            Y = y[N:P * N].reshape(P - 1, N, -1).mean(0)  # legacy: discard first period
+        d = irfft(rfft(Y, axis=0) / rfft(periodic_sweep(meta))[:, None], N, axis=0)
         return d.reshape(M, L, -1).transpose(2, 0, 1) / g  # tails longer than L leak into speaker m+1
     # noise: block-wise cross-correlation, normalised by each channel's energy
     C, n = fs, meta['dur']
@@ -128,15 +204,16 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
     g = sub.add_parser('gen')
-    g.add_argument('method', choices=['ess', 'perfect', 'noise'])
+    g.add_argument('method', choices=['ess', 'perfect', 'noise', 'cyclic'])
     g.add_argument('-o', '--out', required=True)
     g.add_argument('--fs', type=int, default=48000)
     g.add_argument('--speakers', type=int, default=128)
-    g.add_argument('--ir-len', type=float, default=0.25, help='s; slot per speaker, sets the perfect-sweep period')
+    g.add_argument('--ir-len', type=float, default=None, help='RIR support/spacing in s; default 0.75 for cyclic, 0.25 otherwise')
     g.add_argument('--gain', type=float, default=0.5)
     g.add_argument('--sweep-len', type=float, default=2.0, help='s (ess)')
-    g.add_argument('--f1', type=float, default=20.0, help='Hz (ess)')
-    g.add_argument('--periods', type=int, default=4, help='perfect; first is discarded')
+    g.add_argument('--f1', type=float, default=20.0, help='Hz (ess or exponential cyclic)')
+    g.add_argument('--waveform', choices=['linear', 'exponential'], default='linear', help='cyclic sweep shape')
+    g.add_argument('--periods', type=int, default=None, help='cyclic: measured periods (default 1); perfect: total periods (default 4, first discarded)')
     g.add_argument('--dur', type=float, default=60.0, help='s (noise)')
     g.add_argument('--seed', type=int, default=0, help='noise')
     d = sub.add_parser('deconv')
@@ -149,9 +226,17 @@ if __name__ == '__main__':
     if a.cmd == 'test':
         test()
     elif a.cmd == 'gen':
-        meta = dict(method=a.method, fs=a.fs, speakers=a.speakers, ir_len=2 * round(a.ir_len * a.fs / 2), gain=a.gain)
+        if a.method == 'cyclic':
+            gen_cyclic_sweeps(a.out, speakers=a.speakers, ir_len=a.ir_len if a.ir_len is not None else 0.75,
+                              fs=a.fs, gain=a.gain, periods=a.periods if a.periods is not None else 1,
+                              waveform=a.waveform, f1=a.f1)
+            p.exit()
+        if a.waveform != 'linear':
+            p.error('--waveform exponential requires gen cyclic')
+        ir_len = a.ir_len if a.ir_len is not None else 0.25
+        meta = dict(method=a.method, fs=a.fs, speakers=a.speakers, ir_len=2 * round(ir_len * a.fs / 2), gain=a.gain)
         meta |= {'ess': dict(sweep_len=round(a.sweep_len * a.fs), f1=a.f1),
-                 'perfect': dict(periods=a.periods),
+                 'perfect': dict(periods=a.periods if a.periods is not None else 4),
                  'noise': dict(dur=round(a.dur * a.fs), seed=a.seed)}[a.method]
         gen(meta, a.out)
     else:
